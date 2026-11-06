@@ -106,7 +106,25 @@ impl RequestHandler {
             }
 
             _ => {
-                if let Some(key_str) = path.strip_prefix("/kv/") {
+                if let Some(chan_str) = path.strip_prefix("/pubsub/") {
+                    if method == Method::POST {
+                        let channel = Bytes::copy_from_slice(chan_str.as_bytes());
+                        let count = self.shard_pool.publish(channel, req.into_body()).await;
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from(count.to_string())))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::METHOD_NOT_ALLOWED)
+                            .body(Full::new(Bytes::from("Method Not Allowed\n")))
+                            .unwrap()
+                    }
+                } else if let Some(rest) = path.strip_prefix("/chan/") {
+                    self.handle_channel_command(&method, rest, &query, req.into_body()).await
+                } else if let Some(rest) = path.strip_prefix("/group/") {
+                    self.handle_group_command(&method, rest, &query, req.into_body()).await
+                } else if let Some(key_str) = path.strip_prefix("/kv/") {
                     self.handle_kv_command(&method, key_str, &query, req.into_body()).await
                 } else {
                     Response::builder()
@@ -115,6 +133,115 @@ impl RequestHandler {
                         .unwrap()
                 }
             }
+        }
+    }
+
+    async fn handle_channel_command(
+        &self,
+        method: &Method,
+        rest: &str,
+        query: &str,
+        body: Bytes,
+    ) -> Response<Full<Bytes>> {
+        if *method != Method::POST {
+            return Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Full::new(Bytes::from("Method Not Allowed\n")))
+                .unwrap();
+        }
+
+        if let Some(ch) = rest.strip_suffix("/send") {
+            let channel = Bytes::copy_from_slice(ch.as_bytes());
+            let capacity = parse_query_param(query, "capacity")
+                .and_then(|c| c.parse::<usize>().ok())
+                .unwrap_or(100);
+            let ttl = parse_ttl_query(query).unwrap_or(Duration::from_secs(60));
+
+            match self.shard_pool.chan_send(channel, body, capacity, ttl).await {
+                Ok(()) => Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::from("OK\n")))
+                    .unwrap(),
+                Err("FULL") => Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Full::new(Bytes::from("FULL\n")))
+                    .unwrap(),
+                Err(e) => Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from(e)))
+                    .unwrap(),
+            }
+        } else if let Some(ch) = rest.strip_suffix("/receive") {
+            let channel = Bytes::copy_from_slice(ch.as_bytes());
+            let timeout_ms = parse_query_param(query, "timeout")
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(30_000);
+
+            match self.shard_pool.chan_receive(channel, Duration::from_millis(timeout_ms)).await {
+                Some(payload) => Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(payload))
+                    .unwrap(),
+                None => Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            }
+        } else {
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from("Not Found\n")))
+                .unwrap()
+        }
+    }
+
+    async fn handle_group_command(
+        &self,
+        method: &Method,
+        rest: &str,
+        query: &str,
+        body: Bytes,
+    ) -> Response<Full<Bytes>> {
+        if *method != Method::POST {
+            return Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Full::new(Bytes::from("Method Not Allowed\n")))
+                .unwrap();
+        }
+
+        if let Some(grp) = rest.strip_suffix("/add") {
+            let group = Bytes::copy_from_slice(grp.as_bytes());
+            let channel = body;
+            self.shard_pool.group_add(group, channel).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from("OK\n")))
+                .unwrap()
+        } else if let Some(grp) = rest.strip_suffix("/discard") {
+            let group = Bytes::copy_from_slice(grp.as_bytes());
+            let channel = body;
+            self.shard_pool.group_discard(group, channel).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from("OK\n")))
+                .unwrap()
+        } else if let Some(grp) = rest.strip_suffix("/send") {
+            let group = Bytes::copy_from_slice(grp.as_bytes());
+            let capacity = parse_query_param(query, "capacity")
+                .and_then(|c| c.parse::<usize>().ok())
+                .unwrap_or(100);
+            let ttl = parse_ttl_query(query).unwrap_or(Duration::from_secs(60));
+
+            let count = self.shard_pool.group_send(group, body, capacity, ttl).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(count.to_string())))
+                .unwrap()
+        } else {
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from("Not Found\n")))
+                .unwrap()
         }
     }
 

@@ -22,8 +22,9 @@ AeroKV is an ultra-lean, multi-threaded, sharded in-memory key-value database bu
 - Eviction: Sampled-LRU.
 
 ## 5. System Features & Core Mechanics
-- Commands: `GET`, `SET`, `EXP`, `SETNX`, `DELETE`, `INCR`, `DECR`, `TTL`, `EXISTS`, `MGET`, `MSET`, `PING`, `STATS`, `FLUSH`.
-- Active Cleanup: Per-shard loop sweeping expired keys every 100ms.
+- Commands: `GET`, `SET`, `EXP`, `SETNX`, `DELETE`, `INCR`, `DECR`, `TTL`, `EXISTS`, `MGET`, `MSET`, `PING`, `STATS`, `FLUSH`, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`.
+- Channel & Pub/Sub Mechanics: Shard-local zero-lock Pub/Sub (`SUBSCRIBE`/`PUBLISH`), FIFO channel mailboxes with `oneshot` long-polling waiters, and group memberships for ASGI channel layers.
+- Active Cleanup: Per-shard loop sweeping expired keys and expired channel messages every 100ms.
 - Communication: Dual TCP listeners for RESP (6380) and HTTP/1.1 & HTTP/2 (16379/8080).
 
 ## 6. Authentication, Authorization & Security
@@ -31,6 +32,7 @@ AeroKV is an ultra-lean, multi-threaded, sharded in-memory key-value database bu
 
 ## 7. REST API Endpoints Reference
 - `GET /kv/{key}`, `PUT /kv/{key}`, `DELETE /kv/{key}`, `POST /kv/{key}/incr`, `GET /kv/{key}/ttl`, `GET /kv/{key}/exists`, `POST /mget`, `POST /mset`, `GET /ping`, `GET /stats`, `POST /flush`.
+- Pub/Sub & Channel Layer: `POST /pubsub/{channel}`, `POST /chan/{channel}/send`, `POST /chan/{channel}/receive`, `POST /group/{group}/add`, `POST /group/{group}/discard`, `POST /group/{group}/send`.
 
 ## 8. WebSocket & Asynchronous Event Protocol Spec
 - Pure TCP with binary streams (HTTP/2) and pipelined multiplexing (RESP).

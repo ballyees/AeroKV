@@ -325,6 +325,97 @@ impl AeroClient {
             Err(AeroError::ServerStatus(resp.status()))
         }
     }
+
+    pub async fn publish(&self, channel: &str, payload: Bytes) -> Result<usize, AeroError> {
+        let ch = self.format_key(channel);
+        let resp = self.send_request(Method::POST, &format!("/pubsub/{}", ch), payload).await?;
+        if resp.status().is_success() {
+            let body = resp.into_body();
+            let s = std::str::from_utf8(&body).map_err(|e| AeroError::Custom(e.to_string()))?;
+            let count = s.trim().parse::<usize>().map_err(|e| AeroError::Custom(e.to_string()))?;
+            Ok(count)
+        } else {
+            Err(AeroError::ServerStatus(resp.status()))
+        }
+    }
+
+    pub async fn chan_send(
+        &self,
+        channel: &str,
+        payload: Bytes,
+        capacity: usize,
+        ttl: Duration,
+    ) -> Result<bool, AeroError> {
+        let ch = self.format_key(channel);
+        let path = format!("/chan/{}/send?capacity={}&ttl={}", ch, capacity, ttl.as_millis());
+        let resp = self.send_request(Method::POST, &path, payload).await?;
+        if resp.status().is_success() {
+            Ok(true)
+        } else if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            Ok(false)
+        } else {
+            Err(AeroError::ServerStatus(resp.status()))
+        }
+    }
+
+    pub async fn chan_receive(
+        &self,
+        channel: &str,
+        timeout: Duration,
+    ) -> Result<Option<Bytes>, AeroError> {
+        let ch = self.format_key(channel);
+        let path = format!("/chan/{}/receive?timeout={}", ch, timeout.as_millis());
+        let resp = self.send_request(Method::POST, &path, Bytes::new()).await?;
+        if resp.status() == StatusCode::OK {
+            Ok(Some(resp.into_body()))
+        } else if resp.status() == StatusCode::NO_CONTENT {
+            Ok(None)
+        } else {
+            Err(AeroError::ServerStatus(resp.status()))
+        }
+    }
+
+    pub async fn group_add(&self, group: &str, channel: &str) -> Result<(), AeroError> {
+        let grp = self.format_key(group);
+        let ch = self.format_key(channel);
+        let resp = self.send_request(Method::POST, &format!("/group/{}/add", grp), Bytes::copy_from_slice(ch.as_bytes())).await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(AeroError::ServerStatus(resp.status()))
+        }
+    }
+
+    pub async fn group_discard(&self, group: &str, channel: &str) -> Result<(), AeroError> {
+        let grp = self.format_key(group);
+        let ch = self.format_key(channel);
+        let resp = self.send_request(Method::POST, &format!("/group/{}/discard", grp), Bytes::copy_from_slice(ch.as_bytes())).await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(AeroError::ServerStatus(resp.status()))
+        }
+    }
+
+    pub async fn group_send(
+        &self,
+        group: &str,
+        payload: Bytes,
+        capacity: usize,
+        ttl: Duration,
+    ) -> Result<usize, AeroError> {
+        let grp = self.format_key(group);
+        let path = format!("/group/{}/send?capacity={}&ttl={}", grp, capacity, ttl.as_millis());
+        let resp = self.send_request(Method::POST, &path, payload).await?;
+        if resp.status().is_success() {
+            let body = resp.into_body();
+            let s = std::str::from_utf8(&body).map_err(|e| AeroError::Custom(e.to_string()))?;
+            let count = s.trim().parse::<usize>().map_err(|e| AeroError::Custom(e.to_string()))?;
+            Ok(count)
+        } else {
+            Err(AeroError::ServerStatus(resp.status()))
+        }
+    }
 }
 
 // C-ABI FFI Layer

@@ -30,65 +30,95 @@ async fn handle_resp_connection(
     let mut write_buf = BytesMut::with_capacity(4096);
     let mut authenticated = !auth.is_enabled();
 
+    let (conn_sub_tx, mut conn_sub_rx) = tokio::sync::mpsc::channel::<(Bytes, Bytes)>(1024);
+    let mut sub_count = 0usize;
+
     loop {
         // Expand read_buf dynamically only when approaching full capacity for large pipelines
         if read_buf.capacity() - read_buf.len() < 1024 {
             read_buf.reserve(8192);
         }
 
-        let n = match stream.read_buf(&mut read_buf).await {
-            Ok(0) => break, // EOF
-            Ok(n) => n,
-            Err(_) => break,
-        };
+        tokio::select! {
+            biased;
+            read_res = stream.read_buf(&mut read_buf) => {
+                match read_res {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        let mut commands = Vec::new();
+                        while let Some(cmd) = parse_resp_command(&mut read_buf) {
+                            commands.push(cmd);
+                        }
 
-        let _ = n;
+                        if commands.is_empty() {
+                            continue;
+                        }
 
-        // Parse all available commands from read_buf
-        let mut commands = Vec::new();
-        while let Some(cmd) = parse_resp_command(&mut read_buf) {
-            commands.push(cmd);
-        }
+                        write_buf.clear();
 
-        if commands.is_empty() {
-            continue;
-        }
+                        if commands.len() == 1 {
+                            let cmd = commands.pop().unwrap();
+                            process_single_command(
+                                cmd,
+                                &auth,
+                                &mut authenticated,
+                                &shard_pool,
+                                &mut write_buf,
+                                &conn_sub_tx,
+                                &mut sub_count,
+                            )
+                            .await;
+                        } else {
+                            let mut can_batch = true;
+                            for c in &commands {
+                                if is_special_command(&c.name) {
+                                    can_batch = false;
+                                    break;
+                                }
+                            }
 
-        write_buf.clear();
+                            if !authenticated || !can_batch {
+                                for cmd in commands {
+                                    process_single_command(
+                                        cmd,
+                                        &auth,
+                                        &mut authenticated,
+                                        &shard_pool,
+                                        &mut write_buf,
+                                        &conn_sub_tx,
+                                        &mut sub_count,
+                                    )
+                                    .await;
+                                }
+                            } else {
+                                process_pipelined_batch(commands, &shard_pool, &mut write_buf).await;
+                            }
+                        }
 
-        // Process commands (pipelined)
-        if commands.len() == 1 {
-            let cmd = commands.pop().unwrap();
-            process_single_command(cmd, &auth, &mut authenticated, &shard_pool, &mut write_buf).await;
-        } else {
-            // Check if there are non-shard or auth commands in pipeline
-            let mut can_batch = true;
-            for c in &commands {
-                if is_special_command(&c.name) {
-                    can_batch = false;
+                        if !write_buf.is_empty() && stream.write_all(&write_buf).await.is_err() {
+                            break;
+                        }
+
+                        // Adaptive shrink: If buffers ballooned due to a massive batch/value, shrink back to conserve RAM
+                        if read_buf.capacity() > 64 * 1024 && read_buf.is_empty() {
+                            read_buf = BytesMut::with_capacity(4096);
+                        }
+                        if write_buf.capacity() > 64 * 1024 {
+                            write_buf = BytesMut::with_capacity(4096);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            Some((ch, msg)) = conn_sub_rx.recv(), if sub_count > 0 => {
+                write_buf.clear();
+                write_buf.extend_from_slice(b"*3\r\n$7\r\nmessage\r\n");
+                append_bulk_string(&mut write_buf, &ch);
+                append_bulk_string(&mut write_buf, &msg);
+                if stream.write_all(&write_buf).await.is_err() {
                     break;
                 }
             }
-
-            if !authenticated || !can_batch {
-                for cmd in commands {
-                    process_single_command(cmd, &auth, &mut authenticated, &shard_pool, &mut write_buf).await;
-                }
-            } else {
-                process_pipelined_batch(commands, &shard_pool, &mut write_buf).await;
-            }
-        }
-
-        if !write_buf.is_empty() && stream.write_all(&write_buf).await.is_err() {
-            break;
-        }
-
-        // Adaptive shrink: If buffers ballooned due to a massive batch/value, shrink back to conserve RAM for C100k
-        if read_buf.capacity() > 64 * 1024 && read_buf.is_empty() {
-            read_buf = BytesMut::with_capacity(4096);
-        }
-        if write_buf.capacity() > 64 * 1024 {
-            write_buf = BytesMut::with_capacity(4096);
         }
     }
 }
@@ -179,7 +209,7 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 fn is_special_command(name: &str) -> bool {
     matches!(
         name,
-        "AUTH" | "PING" | "COMMAND" | "CONFIG" | "INFO" | "STATS" | "FLUSHDB" | "FLUSHALL" | "HELLO" | "QUIT"
+        "AUTH" | "PING" | "COMMAND" | "CONFIG" | "INFO" | "STATS" | "FLUSHDB" | "FLUSHALL" | "HELLO" | "QUIT" | "PUBLISH" | "SUBSCRIBE" | "UNSUBSCRIBE"
     )
 }
 
@@ -189,6 +219,8 @@ async fn process_single_command(
     authenticated: &mut bool,
     shard_pool: &ShardPool,
     out: &mut BytesMut,
+    conn_sub_tx: &tokio::sync::mpsc::Sender<(Bytes, Bytes)>,
+    sub_count: &mut usize,
 ) {
     let name = cmd.name.as_str();
 
@@ -494,6 +526,53 @@ async fn process_single_command(
             out.extend_from_slice(b"+OK\r\n");
         }
 
+        "PUBLISH" => {
+            if cmd.args.len() < 2 {
+                out.extend_from_slice(b"-ERR wrong number of arguments for 'publish' command\r\n");
+                return;
+            }
+            let channel = cmd.args[0].clone();
+            let payload = cmd.args[1].clone();
+            let count = shard_pool.publish(channel, payload).await;
+            append_integer(out, count as i64);
+        }
+
+        "SUBSCRIBE" => {
+            if cmd.args.is_empty() {
+                out.extend_from_slice(b"-ERR wrong number of arguments for 'subscribe' command\r\n");
+                return;
+            }
+            for ch in cmd.args {
+                if let Some(mut sub_rx) = shard_pool.subscribe(ch.clone()).await {
+                    *sub_count += 1;
+                    let tx = conn_sub_tx.clone();
+                    let ch_clone = ch.clone();
+                    tokio::spawn(async move {
+                        while let Some(msg) = sub_rx.recv().await {
+                            if tx.send((ch_clone.clone(), msg)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    out.extend_from_slice(b"*3\r\n$9\r\nsubscribe\r\n");
+                    append_bulk_string(out, &ch);
+                    append_integer(out, *sub_count as i64);
+                }
+            }
+        }
+
+        "UNSUBSCRIBE" => {
+            // Acknowledge unsubscribe
+            for ch in cmd.args {
+                if *sub_count > 0 {
+                    *sub_count -= 1;
+                }
+                out.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n");
+                append_bulk_string(out, &ch);
+                append_integer(out, *sub_count as i64);
+            }
+        }
+
         _ => {
             out.extend_from_slice(b"-ERR unknown command '");
             out.extend_from_slice(name.as_bytes());
@@ -626,4 +705,53 @@ fn append_integer<T: itoa::Integer>(out: &mut BytesMut, n: T) {
     out.extend_from_slice(b":");
     out.extend_from_slice(itoa_buf.format(n).as_bytes());
     out.extend_from_slice(b"\r\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::{run_shard_worker, LocalShard, ShardCommand};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_resp_publish_subscribe() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ShardCommand>(32);
+        tokio::spawn(async move {
+            let shard = LocalShard::new(1024 * 1024);
+            run_shard_worker(shard, rx).await;
+        });
+        let pool = ShardPool::new(vec![tx]);
+        let auth = Authenticator::new("");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let s_pool = pool.clone();
+        let s_auth = auth.clone();
+        tokio::spawn(async move {
+            run_resp_server(listener, s_auth, s_pool).await;
+        });
+
+        // Subscriber connection
+        let mut sub_stream = TcpStream::connect(addr).await.unwrap();
+        sub_stream.write_all(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n").await.unwrap();
+
+        let mut buf = vec![0u8; 1024];
+        let n = sub_stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("subscribe"), "Expected subscribe confirmation: {resp}");
+
+        // Publisher connection
+        let mut pub_stream = TcpStream::connect(addr).await.unwrap();
+        pub_stream.write_all(b"*3\r\n$7\r\nPUBLISH\r\n$4\r\nnews\r\n$5\r\nhello\r\n").await.unwrap();
+        let n_pub = pub_stream.read(&mut buf).await.unwrap();
+        let pub_resp = String::from_utf8_lossy(&buf[..n_pub]);
+        assert!(pub_resp.contains(":1\r\n"), "Expected 1 subscriber: {pub_resp}");
+
+        // Read message from subscriber
+        let n_sub = sub_stream.read(&mut buf).await.unwrap();
+        let sub_msg = String::from_utf8_lossy(&buf[..n_sub]);
+        assert!(sub_msg.contains("message") && sub_msg.contains("hello"), "Expected pushed message: {sub_msg}");
+    }
 }

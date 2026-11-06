@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -84,11 +84,50 @@ pub enum ShardCommand {
     Flush {
         resp: oneshot::Sender<()>,
     },
+    Publish {
+        channel: Bytes,
+        payload: Bytes,
+        resp: oneshot::Sender<usize>,
+    },
+    Subscribe {
+        channel: Bytes,
+        tx: mpsc::Sender<Bytes>,
+        resp: oneshot::Sender<()>,
+    },
+    ChanSend {
+        channel: Bytes,
+        payload: Bytes,
+        capacity: usize,
+        ttl: Duration,
+        resp: oneshot::Sender<Result<(), &'static str>>,
+    },
+    ChanReceive {
+        channel: Bytes,
+        resp: oneshot::Sender<Bytes>,
+    },
+    GroupAdd {
+        group: Bytes,
+        channel: Bytes,
+        resp: oneshot::Sender<()>,
+    },
+    GroupDiscard {
+        group: Bytes,
+        channel: Bytes,
+        resp: oneshot::Sender<()>,
+    },
+    GroupMembers {
+        group: Bytes,
+        resp: oneshot::Sender<Vec<Bytes>>,
+    },
 }
 
 pub struct LocalShard {
     store: FxHashMap<Bytes, CacheValue>,
     expiration_timeline: BTreeMap<Instant, Vec<Bytes>>,
+    pubsub_subscribers: FxHashMap<Bytes, Vec<mpsc::Sender<Bytes>>>,
+    channel_queues: FxHashMap<Bytes, VecDeque<(Bytes, Instant)>>,
+    channel_waiters: FxHashMap<Bytes, VecDeque<oneshot::Sender<Bytes>>>,
+    groups: FxHashMap<Bytes, FxHashSet<Bytes>>,
     max_memory_bytes: usize,
     used_memory_bytes: usize,
     tick: u64,
@@ -103,6 +142,10 @@ impl LocalShard {
         Self {
             store: FxHashMap::default(),
             expiration_timeline: BTreeMap::new(),
+            pubsub_subscribers: FxHashMap::default(),
+            channel_queues: FxHashMap::default(),
+            channel_waiters: FxHashMap::default(),
+            groups: FxHashMap::default(),
             max_memory_bytes,
             used_memory_bytes: 0,
             tick: 0,
@@ -333,6 +376,10 @@ impl LocalShard {
     pub fn flush(&mut self) {
         self.store.clear();
         self.expiration_timeline.clear();
+        self.pubsub_subscribers.clear();
+        self.channel_queues.clear();
+        self.channel_waiters.clear();
+        self.groups.clear();
         self.used_memory_bytes = 0;
     }
 
@@ -345,6 +392,93 @@ impl LocalShard {
             expired_keys: self.expired_keys,
             evicted_keys: self.evicted_keys,
         }
+    }
+
+    pub fn publish(&mut self, channel: &Bytes, payload: Bytes) -> usize {
+        if let Some(subs) = self.pubsub_subscribers.get_mut(channel) {
+            let mut delivered = 0;
+            subs.retain(|sub| {
+                match sub.try_send(payload.clone()) {
+                    Ok(_) => {
+                        delivered += 1;
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                }
+            });
+            delivered
+        } else {
+            0
+        }
+    }
+
+    pub fn subscribe(&mut self, channel: Bytes, tx: mpsc::Sender<Bytes>) {
+        self.pubsub_subscribers.entry(channel).or_default().push(tx);
+    }
+
+    pub fn chan_send(
+        &mut self,
+        channel: Bytes,
+        payload: Bytes,
+        capacity: usize,
+        ttl: Duration,
+    ) -> Result<(), &'static str> {
+        if let Some(waiters) = self.channel_waiters.get_mut(&channel) {
+            while let Some(waiter) = waiters.pop_front() {
+                if waiter.send(payload.clone()).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+
+        let queue = self.channel_queues.entry(channel).or_default();
+        let now = Instant::now();
+        while let Some((_, exp)) = queue.front() {
+            if *exp <= now {
+                queue.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if queue.len() >= capacity {
+            return Err("FULL");
+        }
+
+        queue.push_back((payload, now + ttl));
+        Ok(())
+    }
+
+    pub fn chan_receive(&mut self, channel: Bytes, resp: oneshot::Sender<Bytes>) {
+        let now = Instant::now();
+        if let Some(queue) = self.channel_queues.get_mut(&channel) {
+            while let Some((payload, exp)) = queue.pop_front() {
+                if exp > now {
+                    let _ = resp.send(payload);
+                    return;
+                }
+            }
+        }
+
+        self.channel_waiters.entry(channel).or_default().push_back(resp);
+    }
+
+    pub fn group_add(&mut self, group: Bytes, channel: Bytes) {
+        self.groups.entry(group).or_default().insert(channel);
+    }
+
+    pub fn group_discard(&mut self, group: Bytes, channel: Bytes) {
+        if let Some(set) = self.groups.get_mut(&group) {
+            set.remove(&channel);
+            if set.is_empty() {
+                self.groups.remove(&group);
+            }
+        }
+    }
+
+    pub fn group_members(&self, group: &Bytes) -> Vec<Bytes> {
+        self.groups.get(group).map(|set| set.iter().cloned().collect()).unwrap_or_default()
     }
 
     pub fn active_cleanup_job(&mut self) {
@@ -364,6 +498,30 @@ impl LocalShard {
                 }
             }
         }
+
+        // Clean expired messages from channel queues
+        self.channel_queues.retain(|_, queue| {
+            while let Some((_, exp)) = queue.front() {
+                if *exp <= now {
+                    queue.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !queue.is_empty()
+        });
+
+        // Clean closed waiters
+        self.channel_waiters.retain(|_, waiters| {
+            waiters.retain(|w| !w.is_closed());
+            !waiters.is_empty()
+        });
+
+        // Clean closed pubsub subscribers
+        self.pubsub_subscribers.retain(|_, subs| {
+            subs.retain(|s| !s.is_closed());
+            !subs.is_empty()
+        });
     }
 }
 
@@ -410,6 +568,33 @@ fn execute_shard_command(shard: &mut LocalShard, cmd: ShardCommand) {
         ShardCommand::Flush { resp } => {
             shard.flush();
             let _ = resp.send(());
+        }
+        ShardCommand::Publish { channel, payload, resp } => {
+            let delivered = shard.publish(&channel, payload);
+            let _ = resp.send(delivered);
+        }
+        ShardCommand::Subscribe { channel, tx, resp } => {
+            shard.subscribe(channel, tx);
+            let _ = resp.send(());
+        }
+        ShardCommand::ChanSend { channel, payload, capacity, ttl, resp } => {
+            let res = shard.chan_send(channel, payload, capacity, ttl);
+            let _ = resp.send(res);
+        }
+        ShardCommand::ChanReceive { channel, resp } => {
+            shard.chan_receive(channel, resp);
+        }
+        ShardCommand::GroupAdd { group, channel, resp } => {
+            shard.group_add(group, channel);
+            let _ = resp.send(());
+        }
+        ShardCommand::GroupDiscard { group, channel, resp } => {
+            shard.group_discard(group, channel);
+            let _ = resp.send(());
+        }
+        ShardCommand::GroupMembers { group, resp } => {
+            let members = shard.group_members(&group);
+            let _ = resp.send(members);
         }
     }
 }
@@ -594,6 +779,97 @@ impl ShardPool {
             }
         }
     }
+
+    pub async fn publish(&self, channel: Bytes, payload: Bytes) -> usize {
+        let idx = self.shard_idx(&channel);
+        let (tx, rx) = oneshot::channel();
+        if self.shards[idx].send(ShardCommand::Publish { channel, payload, resp: tx }).await.is_ok() {
+            rx.await.unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    pub async fn subscribe(&self, channel: Bytes) -> Option<mpsc::Receiver<Bytes>> {
+        let idx = self.shard_idx(&channel);
+        let (sub_tx, sub_rx) = mpsc::channel(1024);
+        let (tx, rx) = oneshot::channel();
+        if self.shards[idx].send(ShardCommand::Subscribe { channel, tx: sub_tx, resp: tx }).await.is_ok() {
+            let _ = rx.await;
+            Some(sub_rx)
+        } else {
+            None
+        }
+    }
+
+    pub async fn chan_send(
+        &self,
+        channel: Bytes,
+        payload: Bytes,
+        capacity: usize,
+        ttl: Duration,
+    ) -> Result<(), &'static str> {
+        let idx = self.shard_idx(&channel);
+        let (tx, rx) = oneshot::channel();
+        if self.shards[idx].send(ShardCommand::ChanSend { channel, payload, capacity, ttl, resp: tx }).await.is_ok() {
+            rx.await.unwrap_or(Err("Shard error"))
+        } else {
+            Err("Shard send error")
+        }
+    }
+
+    pub async fn chan_receive(&self, channel: Bytes, timeout: Duration) -> Option<Bytes> {
+        let idx = self.shard_idx(&channel);
+        let (tx, rx) = oneshot::channel();
+        if self.shards[idx].send(ShardCommand::ChanReceive { channel, resp: tx }).await.is_ok() {
+            tokio::time::timeout(timeout, rx).await.ok().and_then(|r| r.ok())
+        } else {
+            None
+        }
+    }
+
+    pub async fn group_add(&self, group: Bytes, channel: Bytes) {
+        let idx = self.shard_idx(&group);
+        let (tx, rx) = oneshot::channel();
+        if self.shards[idx].send(ShardCommand::GroupAdd { group, channel, resp: tx }).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    pub async fn group_discard(&self, group: Bytes, channel: Bytes) {
+        let idx = self.shard_idx(&group);
+        let (tx, rx) = oneshot::channel();
+        if self.shards[idx].send(ShardCommand::GroupDiscard { group, channel, resp: tx }).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    pub async fn group_members(&self, group: Bytes) -> Vec<Bytes> {
+        let idx = self.shard_idx(&group);
+        let (tx, rx) = oneshot::channel();
+        if self.shards[idx].send(ShardCommand::GroupMembers { group, resp: tx }).await.is_ok() {
+            rx.await.unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub async fn group_send(
+        &self,
+        group: Bytes,
+        payload: Bytes,
+        capacity: usize,
+        ttl: Duration,
+    ) -> usize {
+        let members = self.group_members(group).await;
+        let mut delivered = 0;
+        for member in members {
+            if self.chan_send(member, payload.clone(), capacity, ttl).await.is_ok() {
+                delivered += 1;
+            }
+        }
+        delivered
+    }
 }
 
 #[cfg(test)]
@@ -661,5 +937,58 @@ mod tests {
 
         assert!(!shard.store.contains_key(&k1));
         assert!(shard.store.contains_key(&k2));
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_shard() {
+        let mut shard = LocalShard::new(1024 * 1024);
+        let ch = Bytes::from("news");
+        let (tx, mut rx) = mpsc::channel(10);
+        shard.subscribe(ch.clone(), tx);
+
+        let delivered = shard.publish(&ch, Bytes::from("breaking"));
+        assert_eq!(delivered, 1);
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received, Bytes::from("breaking"));
+    }
+
+    #[tokio::test]
+    async fn test_chan_send_receive_queue_and_waiter() {
+        let mut shard = LocalShard::new(1024 * 1024);
+        let ch = Bytes::from("asgi.worker");
+
+        // Send before receive (buffered in queue)
+        assert!(shard.chan_send(ch.clone(), Bytes::from("msg1"), 10, Duration::from_secs(60)).is_ok());
+        let (tx1, rx1) = oneshot::channel();
+        shard.chan_receive(ch.clone(), tx1);
+        assert_eq!(rx1.await.unwrap(), Bytes::from("msg1"));
+
+        // Receive before send (instant waiter wake)
+        let (tx2, rx2) = oneshot::channel();
+        shard.chan_receive(ch.clone(), tx2);
+        assert!(shard.chan_send(ch.clone(), Bytes::from("msg2"), 10, Duration::from_secs(60)).is_ok());
+        assert_eq!(rx2.await.unwrap(), Bytes::from("msg2"));
+
+        // Capacity full test
+        assert!(shard.chan_send(ch.clone(), Bytes::from("c1"), 1, Duration::from_secs(60)).is_ok());
+        assert_eq!(shard.chan_send(ch.clone(), Bytes::from("c2"), 1, Duration::from_secs(60)), Err("FULL"));
+    }
+
+    #[test]
+    fn test_group_add_discard_members() {
+        let mut shard = LocalShard::new(1024 * 1024);
+        let group = Bytes::from("chat_room");
+        let ch1 = Bytes::from("user1");
+        let ch2 = Bytes::from("user2");
+
+        shard.group_add(group.clone(), ch1.clone());
+        shard.group_add(group.clone(), ch2.clone());
+        let members = shard.group_members(&group);
+        assert_eq!(members.len(), 2);
+
+        shard.group_discard(group.clone(), ch1.clone());
+        let members_after = shard.group_members(&group);
+        assert_eq!(members_after.len(), 1);
+        assert_eq!(members_after[0], ch2);
     }
 }

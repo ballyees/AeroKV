@@ -15,4 +15,6 @@ classifiers = [
 [tool.maturin]
 features = ["pyo3/extension-module"]
 manifest-path = "Cargo.toml"
+python-source = "python"
+module-name = "aerokv._aerokv"
 
