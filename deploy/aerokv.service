@@ -1,0 +1,20 @@
+[Unit]
+Description=AeroKV In-Memory High-Performance Key-Value Database
+After=network.target
+
+[Service]
+Type=simple
+User=aerokv
+Group=aerokv
+LimitNOFILE=1048576
+LimitNPROC=524288
+Environment="AEROKV_HTTP_PORT=16379"
+Environment="AEROKV_RESP_PORT=6380"
+Environment="AEROKV_MAX_MEM_MB=8192"
+ExecStart=/usr/local/bin/aerokv-server
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+

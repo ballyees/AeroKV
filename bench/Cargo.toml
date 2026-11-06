@@ -1,0 +1,15 @@
+[package]
+name = "aerokv-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread"] }
+core-client = { path = "../core-client" }
+redis = { version = "0.27", features = ["tokio-comp"] }
+hdrhistogram = "7.5"
+clap = { version = "4.5", features = ["derive"] }
+bytes = "1.10"
+h2 = "0.4"
+http = "1.2"
+
