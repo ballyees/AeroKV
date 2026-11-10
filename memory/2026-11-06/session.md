@@ -7,10 +7,10 @@
 * **Leftover Blockers:** None.
 
 ### Current Session Tracking
-* **Active Task:** Implemented Path B (native `AeroChannelLayer` in Python with server-side Pub/Sub & Channel primitives) and created `TODO_REDIS.md` (Path A roadmap).
-* **Last Completed Step:** Successfully executed full workspace tests (`cargo test --workspace`) and Python pytest suite (`pytest tests/test_channels.py`), with all 6 channel layer E2E tests passing.
-* **Next Action:** Ready for next user requirements.
-* **Summary of Activity:** Added lock-free Pub/Sub & channel FIFO mailboxes to `LocalShard`, RESP `SUBSCRIBE`/`PUBLISH`, HTTP channel endpoints, `core-client` methods, PyO3 bindings, and `AeroChannelLayer` in Python. Created `TODO_REDIS.md` and walkthrough artifact.
-* **Progress / Changes:** Modified `server/src/shard.rs`, `server/src/resp.rs`, `server/src/protocol.rs`, `core-client/src/lib.rs`, `clients/python/Cargo.toml`, `clients/python/pyproject.toml`, `clients/python/src/lib.rs`. Created `TODO_REDIS.md`, `clients/python/python/aerokv/channels.py`, `clients/python/python/aerokv/__init__.py`, `clients/python/tests/test_channels.py`.
+* **Active Task:** Executed empirical three-way benchmark: AeroKV vs Redis vs Dragonfly across raw KV engine and Django Channel Layers.
+* **Last Completed Step:** Ran `target/release/aerokv-bench` and `clients/python/bench_channels_threeway.py` against live Redis 7, Dragonfly latest, and AeroKV release.
+* **Next Action:** Present comparative benchmark matrix to user.
+* **Summary of Activity:** Benchmarked raw KV throughput (AeroKV RESP reached 62k QPS unpipelined and 801k QPS pipelined vs Redis 58k QPS and Dragonfly 42k QPS). In Django Channel Layer tests, `AeroChannelLayer` achieved 8,182 ops/sec P2P (0.27ms p50) vs Redis 1,783 ops/sec (40.9ms p50) and Dragonfly 1,049 ops/sec (99.7ms p50). In group fan-out, AeroKV reached 19,569 delivered ops/sec (0.36ms p50) vs Redis 2,392 ops/sec (353ms p50).
+* **Progress / Changes:** Added `clients/python/bench_channels_threeway.py`.
 * **Blockers / Unresolved Items:** None.
 
